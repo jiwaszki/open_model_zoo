@@ -21,7 +21,8 @@ class Model:
     def __init__(self, ie, model_path, input_transform=None):
         self.logger = logging.getLogger()
         self.logger.info('Reading network from IR...')
-        self.net = ie.read_network(model_path)
+        self.net = ie.read_network(str(model_path) + '.xml',
+                                   str(model_path) + '.bin')
         self.set_batch_size(1)
         self.input_transform = input_transform
 
