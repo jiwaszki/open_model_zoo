@@ -126,11 +126,20 @@ class AsyncPipeline:
         userdata_tuple = tuple(userdata + [preprocessing_meta])
         self.infer_queue.async_infer(inputs=inputs, userdata=userdata_tuple)
 
-    def get_result(self, id):
+    def get_raw_result(self, id):
         if id in self.completed_request_results:
-            raw_result, meta, preprocess_meta = self.completed_request_results.pop(id)
+            return self.completed_request_results.pop(id)
+        return None
+
+    def get_result(self, id):
+        result = self.get_raw_result(id)
+        if result:
+            raw_result, meta, preprocess_meta = result
             return self.model.postprocess(raw_result, preprocess_meta), meta
         return None
+
+    def has_completed_request(self):
+        return len(self.completed_request_results) != 0
 
     def is_ready(self):
         return self.infer_queue.is_ready()
