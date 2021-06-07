@@ -15,16 +15,9 @@
 """
 
 import logging
-from os import stat_result
 import threading
 from collections import deque
 from typing import Dict, Set
-
-from openvino.inference_engine import InferQueue, StatusCode
-
-### TODO: Remove when fixed by demos
-import numpy
-###
 
 
 def parse_devices(device_string):
@@ -96,18 +89,36 @@ def get_user_config(
 
 
 class AsyncPipeline:
-    def __init__(self, network, model, jobs=1):
+    def __init__(self, ie, model, plugin_config, device="CPU", max_num_requests=1):
         self.model = model
+        self.logger = logging.getLogger()
+
+        self.logger.info("Loading network to {} plugin...".format(device))
+        self.exec_net = ie.load_network(
+            network=self.model.net,
+            device_name=device,
+            config=plugin_config,
+            num_requests=max_num_requests,
+        )
+        if max_num_requests == 0:
+            # ExecutableNetwork doesn't allow creation of additional InferRequests. Reload ExecutableNetwork
+            # +1 to use it as a buffer of the pipeline
+            self.exec_net = ie.load_network(
+                network=self.model.net,
+                device_name=device,
+                config=plugin_config,
+                num_requests=len(self.exec_net.requests) + 1,
+            )
+
+        self.empty_requests = deque(self.exec_net.requests)
         self.completed_request_results = {}
         self.callback_exceptions = {}
+        self.event = threading.Event()
 
-        self.infer_queue = InferQueue(network, jobs)
-        self.infer_queue.set_infer_callback(self.inference_completion_callback)
-
-    def inference_completion_callback(self, request, status, userdata):
+    def inference_completion_callback(self, status, callback_args):
         try:
-            id, meta, preprocessing_meta = userdata
-            if status != StatusCode.OK:
+            request, id, meta, preprocessing_meta = callback_args
+            if status != 0:
                 raise RuntimeError(
                     "Infer Request has returned status code {}".format(status)
                 )
@@ -115,16 +126,21 @@ class AsyncPipeline:
                 key: blob.buffer for key, blob in request.output_blobs.items()
             }
             self.completed_request_results[id] = (raw_outputs, meta, preprocessing_meta)
+            self.empty_requests.append(request)
         except Exception as e:
             self.callback_exceptions.append(e)
+        self.event.set()
 
-    def async_infer(self, inputs, userdata):
+    def submit_data(self, inputs, id, meta):
+        request = self.empty_requests.popleft()
+        if len(self.empty_requests) == 0:
+            self.event.clear()
         inputs, preprocessing_meta = self.model.preprocess(inputs)
-        ### TODO: Remove when fixed by demos
-        inputs["data"] = inputs["data"].astype(numpy.float32)
-        ###
-        userdata_tuple = tuple(userdata + [preprocessing_meta])
-        self.infer_queue.async_infer(inputs=inputs, userdata=userdata_tuple)
+        request.set_completion_callback(
+            py_callback=self.inference_completion_callback,
+            py_data=(request, id, meta, preprocessing_meta),
+        )
+        request.async_infer(inputs=inputs)
 
     def get_raw_result(self, id):
         if id in self.completed_request_results:
@@ -142,7 +158,12 @@ class AsyncPipeline:
         return len(self.completed_request_results) != 0
 
     def is_ready(self):
-        return self.infer_queue.is_ready()
+        return len(self.empty_requests) != 0
 
-    def wait_all(self):
-        return self.infer_queue.wait_all()
+    def await_all(self):
+        for request in self.exec_net.requests:
+            request.wait()
+
+    def await_any(self):
+        if len(self.empty_requests) == 0:
+            self.event.wait()
